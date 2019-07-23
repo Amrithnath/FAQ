@@ -2,51 +2,59 @@ const { history, ctxUser, slugify } = require('../helpers')
 const { algolia, slack } = require('../integrations')
 
 const confTagList = ctx =>
-  Object.values(ctx.prisma._meta.configuration.tags).reduce((acc, x) => acc.concat(x), [])
+  Object.values(ctx.photon._meta.configuration.tags).reduce((acc, x) => acc.concat(x), [])
 
 module.exports = {
   Query: {
-    zNode: (_, args, ctx, info) => ctx.prisma.query.zNode(args, info)
+    zNode: async (_, args, ctx) =>
+      ctx.photon.nodes.findOne({
+        ...args,
+        include: {
+          question: { include: { user: true } },
+          answer: { include: { user: true, sources: true } },
+          tags: { include: { user: true } },
+          flags: { include: { user: true } }
+        }
+      })
   },
   Mutation: {
-    createQuestionAndTags: async (_, { title, tags }, ctx, info) => {
+    createQuestionAndTags: async (_, { title, tags }, ctx) => {
       const tagList = confTagList(ctx)
 
-      const node = await ctx.prisma.mutation.createZNode(
-        {
-          data: {
-            question: {
-              create: {
-                title,
-                slug: slugify(title),
-                user: { connect: { id: ctxUser(ctx).id } }
-              }
-            },
-            tags: {
-              create: tags
-                .filter(label => tagList.includes(label))
-                .map(label => ({
-                  label,
-                  user: { connect: { id: ctxUser(ctx).id } }
-                }))
-            },
-            flags: {
-              create: {
-                type: 'unanswered',
-                user: { connect: { id: ctxUser(ctx).id } }
-              }
-            }
-          }
-        },
-        `
-        {
-          id
-          question {
-            id
-          }
+      // TODO: Make a nested operation (See Notes.md)
+      const node = await ctx.photon.nodes.create({
+        data: {
+          dummy: true
         }
-        `
+      })
+      const question = await ctx.photon.questions.create({
+        data: {
+          title,
+          slug: slugify(title),
+          user: { connect: { id: ctxUser(ctx).id } },
+          node: { connect: { id: node.id } }
+        }
+      })
+      await Promise.all(
+        tags
+          .filter(label => tagList.includes(label))
+          .map(label =>
+            ctx.photon.tags.create({
+              data: {
+                label,
+                user: { connect: { id: ctxUser(ctx).id } },
+                node: { connect: { id: node.id } }
+              }
+            })
+          )
       )
+      await ctx.photon.flags.create({
+        data: {
+          type: 'unanswered',
+          user: { connect: { id: ctxUser(ctx).id } },
+          node: { connect: { id: node.id } }
+        }
+      })
 
       await history.push(ctx, {
         action: 'CREATED',
@@ -58,31 +66,27 @@ module.exports = {
       algolia.addNode(ctx, node.id)
       slack.sendToChannel(ctx, node.id)
 
-      return ctx.prisma.query.question({ where: { id: node.question.id } }, info)
+      return ctx.photon.questions.findOne({
+        where: { id: question.id },
+        include: {
+          node: {
+            include: { flags: { include: { user: true } }, tags: { include: { user: true } } }
+          },
+          user: true
+        }
+      })
     },
     updateQuestionAndTags: async (_, { id, title, previousTitle, tags }, ctx, info) => {
       const tagList = confTagList(ctx)
 
-      const node = (await ctx.prisma.query.question(
-        { where: { id } },
-        `
-        {
-          node {
-            id
-            question {
-              title
-            }
-            tags {
-              id
-              label
-            }
-          }
-        }
-        `
-      )).node
+      const node = (await ctx.photon.questions.findOne({
+        where: { id },
+        include: { node: { include: { question: true, tags: true } } }
+      })).node
+
       if (previousTitle !== node.question.title) {
         throw new Error(
-          "Another user edited the question before you, copy your version and refresh the page. If you don't copy your version, It will be lost"
+          "Another user edited the question before you, copy your version and refresh the page. If you don't copy your version, it will be lost"
         )
       }
 
@@ -95,7 +99,7 @@ module.exports = {
       const mutationsToAdd = tagsToAdd
         .filter(label => tagList.includes(label))
         .map(label =>
-          ctx.prisma.mutation.createTag({
+          ctx.photon.tags.create({
             data: {
               label,
               node: { connect: { id: node.id } },
@@ -105,7 +109,7 @@ module.exports = {
         )
 
       const mutationsToRemove = tagsToRemove.map(tag =>
-        ctx.prisma.mutation.deleteTag({ where: { id: tag.id } })
+        ctx.photon.tags.delete({ where: { id: tag.id } })
       )
 
       await Promise.all([...mutationsToAdd, ...mutationsToRemove])
@@ -121,7 +125,7 @@ module.exports = {
         meta.title = title
       }
 
-      await ctx.prisma.mutation.updateQuestion({
+      await ctx.photon.questions.update({
         where: { id },
         data: {
           title,
@@ -138,12 +142,19 @@ module.exports = {
 
       algolia.updateNode(ctx, node.id)
 
-      return ctx.prisma.query.question(
-        {
-          where: { id }
-        },
-        info
-      )
+      return ctx.photon.questions.findOne({
+        where: { id },
+        include: {
+          node: {
+            include: {
+              answer: { include: { user: true } },
+              flags: { include: { user: true } },
+              tags: { include: { user: true } }
+            }
+          },
+          user: true
+        }
+      })
     }
   }
 }
